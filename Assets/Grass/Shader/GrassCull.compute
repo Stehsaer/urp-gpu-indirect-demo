@@ -1,0 +1,124 @@
+#pragma kernel CSCullAndBuild
+
+// -----------------------------------------------------------------------------
+// GPU-driven grass instance processing.
+// - The CPU uploads the packed geometry + raw instance data and the single indirect
+//   draw args (vertexCount = max index count, instanceCount = total instances).
+// - This kernel resolves a LOD per instance and writes a per-instance record at the
+//   SAME index (no compaction / no atomics). Culled instances get indexCount = 0;
+//   the vertex shader then emits only degenerate vertices for them.
+// - Culling is a placeholder (CullInstance) for now; toggle it with _CullingEnabled.
+// -----------------------------------------------------------------------------
+
+struct VisibleInstance
+{
+    float4x4 objectToWorld;
+    uint4    meta;      // x: indexOffset, y: indexCount (0 = skip)
+};
+
+struct MeshLodMeta
+{
+    uint indexOffset;
+    uint indexCount;
+};
+
+struct MeshBounds
+{
+    float4 min;     
+    float4 max;     
+};
+
+StructuredBuffer<float4x4>          _Instances;         // per instance local-to-world
+StructuredBuffer<uint>              _MeshIndices;       // per instance mesh type index
+StructuredBuffer<MeshLodMeta>       _MeshLodMeta;       // [mesh * 2 + lod]
+StructuredBuffer<MeshBounds>        _MeshBounds;        // per mesh (union of both LODs)
+RWStructuredBuffer<VisibleInstance> _VisibleInstances;  // one slot per instance
+
+uint    _InstanceCount;
+uint    _MeshCount;
+float4x4 _VPMatrix;
+float3  _CameraPositionWS;
+float   _Lod0Distance;
+float   _Lod1Distance;
+uint    _CullBeyondLod1;
+uint    _CullingEnabled;
+
+// -----------------------------------------------------------------------------
+// Frustum culling migrated from the Slang reference.
+// `mat` is the view-projection matrix; its 6 frustum planes are (row3 +/- rowN).
+// -----------------------------------------------------------------------------
+bool TestBoxPlane(float4 plane, float3 boxMin, float3 boxMax)
+{
+    float3 positiveVertex = plane.xyz >= 0.0 ? boxMax : boxMin;
+    return dot(plane.xyz, positiveVertex) + plane.w >= 0.0;
+}
+
+bool Visible(float4x4 mat, float3 boxMin, float3 boxMax)
+{
+    return TestBoxPlane(mat[3] + mat[0], boxMin, boxMax)
+        && TestBoxPlane(mat[3] - mat[0], boxMin, boxMax)
+        && TestBoxPlane(mat[3] + mat[1], boxMin, boxMax)
+        && TestBoxPlane(mat[3] - mat[1], boxMin, boxMax)
+        && TestBoxPlane(mat[3] + mat[2], boxMin, boxMax)
+        && TestBoxPlane(mat[3] - mat[2], boxMin, boxMax);
+}
+
+// Return true when the instance should be culled. `mvp` maps the local AABB to clip space.
+bool CullInstance(float4x4 mvp, float3 boxMin, float3 boxMax)
+{
+    return !Visible(mvp, boxMin, boxMax);
+}
+
+[numthreads(64, 1, 1)]
+void CSCullAndBuild(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _InstanceCount)
+        return;
+
+    float4x4 M = _Instances[i];
+    uint mesh = _MeshIndices[i];
+
+    uint indexOffset = 0;
+    uint indexCount = 0; // 0 = skip this instance
+
+    if (mesh < _MeshCount)
+    {
+        MeshBounds b = _MeshBounds[mesh];
+        // Instance world position = object-space AABB center transformed by the instance matrix.
+        float3 localCenter = (b.min.xyz + b.max.xyz) * 0.5;
+        float3 instancePos = mul(M, float4(localCenter, 1.0)).xyz;
+        float dist = distance(_CameraPositionWS, instancePos);
+
+        // Distance based LOD selection, skip beyond LOD1 when requested.
+        uint lod = 0;
+        bool culled = false;
+        if (dist >= _Lod0Distance)
+            lod = 1;
+        if (dist >= _Lod1Distance)
+        {
+            lod = 1;
+            if (_CullBeyondLod1 != 0)
+                culled = true;
+        }
+
+        if (!culled && _CullingEnabled != 0)
+        {
+            
+            float4x4 mvp = mul(_VPMatrix, M);
+            culled = CullInstance(mvp, b.min.xyz, b.max.xyz);
+        }
+
+        if (!culled)
+        {
+            MeshLodMeta meta = _MeshLodMeta[mesh * 2 + lod];
+            indexOffset = meta.indexOffset;
+            indexCount = meta.indexCount;
+        }
+    }
+
+    VisibleInstance vi;
+    vi.objectToWorld = M;
+    vi.meta = uint4(indexOffset, indexCount, 0, 0);
+    _VisibleInstances[i] = vi;
+}
